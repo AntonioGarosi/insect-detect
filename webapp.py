@@ -12,9 +12,10 @@ Modify the 'configs/config_selector.yaml' file to select the active configuratio
 that will be used to load all configuration parameters.
 
 - load YAML file with configuration parameters and JSON file with detection model parameters
-- stream frames (MJPEG-encoded bitstream) from OAK camera to browser-based web app via HTTP
-- draw SVG overlay with tracker/model data on frames (bounding box, label, confidence, tracking ID)
-- control camera settings via web app
+- stream MJPEG-encoded frames from OAK camera to browser-based web app via HTTP
+- draw SVG overlay with model/tracker data on frames (bounding box, label, confidence, tracking ID)
+- note relevant metadata for each deployment (e.g. start time, location, setting, field notes)
+- configure camera, web app, recording and system settings via web app interface
 - save modified configuration parameters to config file
 - optionally start recording session with specified configuration parameters
 
@@ -24,21 +25,24 @@ partly based on open source scripts available at https://github.com/zauberzeug/n
 import asyncio
 import base64
 import copy
+import logging
 import signal
 import socket
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 import depthai as dai
-from fastapi import Response
-from nicegui import Client, app, binding, core, ui
+from fastapi.responses import StreamingResponse
+from gpiozero import LED
+from nicegui import Client, app, binding, core, run, ui
 
-from utils.app import create_duration_inputs, convert_duration, grid_separator, validate_number
+from utils.app import convert_duration, create_duration_inputs, grid_separator, validate_number
 from utils.config import check_config_changes, parse_json, parse_yaml, update_config_file, update_config_selector
-from utils.log import subprocess_log
+from utils.log import get_oak_info, get_rpi_info, subprocess_log
 from utils.network import get_current_connection, get_ip_address, set_up_network
 from utils.oak import convert_bbox_roi, create_pipeline
 
@@ -55,6 +59,14 @@ LOGS_PATH.mkdir(parents=True, exist_ok=True)
 AUTO_RUN_MARKER = BASE_PATH / ".auto_run_active"
 STREAMING_MARKER = BASE_PATH / ".streaming_active"  # indicates user interaction with web app
 
+# Create 1x1 black pixel PNG as placeholder image that will be shown when no frame is available
+PLACEHOLDER_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+PLACEHOLDER_PNG_BYTES_LENGTH = str(len(PLACEHOLDER_PNG_BYTES)).encode()
+
+# Set available GPIO pins (BCM numbering) for LED (excluding pins that are used by Witty Pi 4 L3V7)
+LED_GPIO_PINS = [18, 23, 24, 25, 8, 7, 12, 16, 20, 21, 27, 22, 10, 9, 11, 13, 19, 26]
+
 # Increase threshold for max. binding propagation time to avoid early warning messages
 binding.MAX_PROPAGATION_TIME = 0.05  # default: 0.01 seconds
 
@@ -66,25 +78,53 @@ OPTIONAL_CONFIG_FIELDS = {
     "deployment.location.longitude",
     "deployment.location.accuracy",
     "deployment.setting",
+    "deployment.distance",
     "deployment.notes",
     "startup.auto_run.fallback"
 }
+
+# Set logging levels and format, stream logs to console and save to file
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s: %(message)s",
+                    handlers=[logging.StreamHandler(sys.stdout),
+                              logging.FileHandler(f"{LOGS_PATH}/{Path(__file__).stem}.log",
+                                                  encoding="utf-8")])
+logger = logging.getLogger()
+logger.info("-------- Web App Logger initialized --------")
 
 
 @ui.page("/")
 async def main_page():
     """Main entry point for the web app."""
-    # Start camera if not already running and set up video stream
-    if not hasattr(app.state, "device") or app.state.device is None:
+    if AUTO_RUN_MARKER.exists() and not STREAMING_MARKER.exists():
+        # Create marker file to indicate user interaction if in auto-run mode
+        STREAMING_MARKER.touch()
+
+    # Start camera if not already running
+    if not getattr(app.state, "device", None):
         await start_camera()
-    await setup_video_stream()
 
-    # Create timer to update frame (and overlay if enabled) depending on camera frame rate
-    app.state.frame_timer = ui.timer(round(1 / app.state.config.webapp.fps, 3), update_frame_and_overlay)
-
-    # Create main content container for UI elements (single column layout for responsive width and centering)
+    # Create main UI content container (single column layout for responsive width and centering)
     with ui.column(align_items="center").classes("w-full max-w-3xl mx-auto"):
         create_ui_layout()
+
+    # Create timer to get latest model/tracker data and update overlay (capped to 10 Hz)
+    app.state.overlay_timer = ui.timer(max(app.state.refresh_interval, 0.1),
+                                       update_overlay, immediate=False)
+
+    # Create timer to update system information from RPi and OAK camera
+    app.state.sys_info_timer = ui.timer(5, update_sys_info, immediate=False)
+
+    # Slow-blink LED to indicate web app is running and user is connected
+    if getattr(app.state, "config", None) and app.state.config.led.enabled:
+        led_gpio_pin = app.state.config.led.gpio_pin
+        for _ in range(30):  # retry for 3 seconds as LED might still be used by other process
+            try:
+                app.state.led = LED(led_gpio_pin)
+                break
+            except Exception:
+                await asyncio.sleep(0.1)
+    if getattr(app.state, "led", None):
+        app.state.led.blink(on_time=1, off_time=1, background=True)
 
 
 @ui.refreshable
@@ -93,11 +133,11 @@ def create_ui_layout():
     create_video_stream_container()
     create_control_elements()
 
-    with ui.card().tight().classes("w-full"):
+    with ui.card().tight().classes("w-full border-l-4 border-emerald-400"):
         with ui.expansion("Deployment", icon="location_on").classes("w-full font-bold"):
             create_deployment_section()
 
-    with ui.card().tight().classes("w-full"):
+    with ui.card().tight().classes("w-full border-l-4 border-cyan-400"):
         with ui.expansion("Configuration", icon="settings").classes("w-full font-bold"):
             with ui.expansion("Camera Settings", icon="photo_camera").classes("w-full font-bold"):
                 create_camera_settings()
@@ -123,15 +163,50 @@ def create_ui_layout():
             with ui.expansion("Network Settings", icon="network_wifi").classes("w-full font-bold"):
                 create_network_settings()
 
-    with ui.card().tight().classes("w-full"):
+    with ui.card().tight().classes("w-full border-l-4 border-slate-500"):
         with ui.expansion("Advanced", icon="build").classes("w-full font-bold"):
+            with ui.expansion("System Info", icon="monitor_heart").classes("w-full font-bold"):
+                create_sys_info_section()
+            ui.separator()
             with ui.expansion("View Logs", icon="article").classes("w-full font-bold"):
                 create_logs_section()
 
-    with ui.row().classes("w-full justify-end mt-2 mb-4"):
-        ui.button("Save Config", on_click=save_config, color="green", icon="save")
-        ui.button("Start Recording", on_click=start_recording, color="teal", icon="play_circle")
-        ui.button("Stop App", on_click=confirm_shutdown, color="red", icon="power_settings_new")
+    with ui.row().classes("w-full justify-end mt-2 mb-4 gap-2"):
+        (ui.button("Save Conf", on_click=save_config, color="green", icon="save")
+         .props("dense"))
+        (ui.button("Start Rec", on_click=start_recording, color="teal", icon="play_circle")
+         .props("dense"))
+        (ui.button("Stop App", on_click=confirm_shutdown, color="red", icon="power_settings_new")
+         .props("dense"))
+
+
+@app.get("/video/stream")
+async def stream_mjpeg():
+    """Stream MJPEG-encoded frames from OAK camera over HTTP."""
+    return StreamingResponse(content=frame_generator(),
+                             media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+def create_video_stream_container():
+    """Create video stream container with responsive aspect ratio and row with camera parameters."""
+    with ui.element("div").classes("w-full p-0 overflow-hidden bg-black border border-gray-700"):
+        with ui.element("div").classes(f"relative w-full pb-[{100/app.state.aspect_ratio}%]"):
+            with ui.element("div").classes("absolute inset-0 flex items-center justify-center"):
+                app.state.frame_ii = (ui.interactive_image(source="/video/stream")
+                                      .classes("max-w-full max-h-full object-contain"))
+
+    with ui.row(align_items="center").classes("w-full gap-2 -mt-3"):
+        (ui.label().classes("font-bold text-xs")
+         .bind_text_from(app.state, "fps", lambda fps: f"FPS: {fps}"))
+        ui.separator().props("vertical")
+        (ui.label().classes("font-bold text-xs")
+         .bind_text_from(app.state, "lens_pos", lambda pos: f"Lens Position: {pos}"))
+        ui.separator().props("vertical")
+        (ui.label().classes("font-bold text-xs")
+         .bind_text_from(app.state, "iso_sens", lambda iso: f"ISO: {iso}"))
+        ui.separator().props("vertical")
+        (ui.label().classes("font-bold text-xs")
+         .bind_text_from(app.state, "exp_time", lambda exp: f"Exposure: {exp:.1f} ms"))
 
 
 async def start_camera():
@@ -145,33 +220,52 @@ async def start_camera():
     app.state.model_active = app.state.config.detection.model.weights
     app.state.config_model = parse_json(BASE_PATH / "models" / app.state.config.detection.model.config)
     app.state.models = sorted([file.name for file in (BASE_PATH / "models").glob("*.blob")])
-    app.state.configs = sorted([file.name for file in (BASE_PATH / "configs").glob("*.yaml")
-                                if file.name != "config_selector.yaml"])
     app.state.scripts = sorted([file.name for file in BASE_PATH.glob("*.py")])
     app.state.logs = sorted([file.name for file in LOGS_PATH.glob("*.log")])
+    app.state.configs = sorted([file.name for file in (BASE_PATH / "configs").glob("*.yaml")
+                                if file.name != "config_selector.yaml"])
 
     # Initialize relevant app.state variables
     app.state.connection = get_current_connection()
-    app.state.start_recording = False
-    app.state.exposure_region_active = False
-    app.state.show_overlay = True
-    app.state.tracker_data = []
+    app.state.refresh_interval = max(round(1 / app.state.config.webapp.fps, 3), 0.033)  # max. 30 FPS
     app.state.labels = app.state.config_model.mappings.labels
+    app.state.show_overlay = True
+    app.state.last_overlay_empty = True
+    app.state.exposure_region_active = False
+    app.state.start_recording = False
     app.state.focus_initialized = False
     app.state.manual_focus_enabled = app.state.config.camera.focus.mode == "manual"
     app.state.focus_range_enabled = app.state.config.camera.focus.mode == "range"
     app.state.focus_distance_enabled = app.state.config.camera.focus.type == "distance"
-    app.state.aspect_ratio = app.state.config.webapp.resolution.width / app.state.config.webapp.resolution.height
     app.state.rec_durations = {
         "default": convert_duration(app.state.config.recording.duration.default),
         "battery": {level: convert_duration(getattr(app.state.config.recording.duration.battery, level))
                     for level in ["high", "medium", "low", "minimal"]}
     }
+    app.state.sys_info = {
+        "rpi_cpu_temp": "NA",
+        "rpi_cpu_usage_avg": "NA",
+        "rpi_cpu_usage_sum": "NA",
+        "rpi_ram_usage": "NA",
+        "rpi_ram_available": "NA",
+        "oak_chip_temp": "NA",
+        "oak_cpu_usage_css": "NA",
+        "oak_cpu_usage_mss": "NA",
+        "oak_ram_usage_ddr": "NA",
+        "oak_ram_available_ddr": "NA",
+        "oak_ram_usage_css": "NA",
+        "oak_ram_available_css": "NA",
+        "oak_ram_usage_mss": "NA",
+        "oak_ram_available_mss": "NA",
+        "oak_ram_usage_cmx": "NA",
+        "oak_ram_available_cmx": "NA"
+    }
+    app.state.aspect_ratio = app.state.config.webapp.resolution.width / app.state.config.webapp.resolution.height
+    app.state.frame_count = 0
     app.state.fps = 0
     app.state.lens_pos = 0
     app.state.iso_sens = 0
     app.state.exp_time = 0
-    app.state.frame_count = 0
     app.state.prev_time = time.monotonic()
 
     # Create OAK camera pipeline and start device in USB2 mode
@@ -180,8 +274,11 @@ async def start_camera():
     app.state.device = dai.Device(pipeline, maxUsbSpeed=dai.UsbSpeed.HIGH)
 
     # Create output queues to get the synchronized HQ frames and tracker + model output
-    app.state.q_frame = app.state.device.getOutputQueue(name="frame", maxSize=4, blocking=False)
-    app.state.q_track = app.state.device.getOutputQueue(name="track", maxSize=4, blocking=False)
+    app.state.q_frame = app.state.device.getOutputQueue(name="frame", maxSize=2, blocking=False)
+    app.state.q_track = app.state.device.getOutputQueue(name="track", maxSize=1, blocking=False)
+
+    # Create output queue to get system information from OAK device
+    app.state.q_syslog = app.state.device.getOutputQueue(name="syslog", maxSize=4, blocking=False)
 
     # Create input queue to send control commands to OAK camera
     app.state.q_ctrl = app.state.device.getInputQueue(name="control", maxSize=4, blocking=False)
@@ -189,74 +286,97 @@ async def start_camera():
     ui.notification("OAK camera pipeline started!", type="positive", timeout=2)
 
 
-async def restart_camera():
-    """Disconnect from OAK device and reload web app."""
-    if hasattr(app.state, "frame_timer") and app.state.frame_timer is not None:
-        app.state.frame_timer.deactivate()
-        app.state.frame_timer = None
+async def close_camera():
+    """Stop streaming and disconnect from OAK device."""
+    for queue in ("q_frame", "q_track", "q_syslog", "q_ctrl"):
+        if getattr(app.state, queue, None):
+            setattr(app.state, queue, None)
 
-    if hasattr(app.state, "device") and app.state.device is not None:
-        app.state.q_frame = None
-        app.state.q_track = None
-        app.state.q_ctrl = None
+    if getattr(app.state, "overlay_timer", None):
+        app.state.overlay_timer.deactivate()
+        app.state.overlay_timer = None
+
+    if getattr(app.state, "sys_info_timer", None):
+        app.state.sys_info_timer.deactivate()
+        app.state.sys_info_timer = None
+
+    if getattr(app.state, "device", None):
         app.state.device.close()
         app.state.device = None
 
-    await asyncio.sleep(0.5)
-    ui.navigate.reload()
+
+def get_frame(q_frame):
+    """Get MJPEG-encoded frame and associated metadata from the OAK camera output queue."""
+    if not q_frame:
+        return None
+    try:
+        frame_msg = q_frame.tryGet()  # depthai.ImgFrame (type: BITSTREAM)
+        if frame_msg is None:
+            return None
+        frame_bytes = frame_msg.getData().tobytes()  # convert numpy array to bytes
+        frame_bytes_length = str(len(frame_bytes)).encode()
+        lens_pos = frame_msg.getLensPosition()
+        iso_sens = frame_msg.getSensitivity()
+        exp_time = frame_msg.getExposureTime().total_seconds() * 1000  # convert to milliseconds
+        return (frame_bytes, frame_bytes_length, lens_pos, iso_sens, exp_time)
+    except Exception:
+        logger.exception("Error getting frame")
+        return None
 
 
-async def setup_video_stream():
-    """Set up serving of frames and updating of associated camera parameters."""
+async def frame_generator():
+    """Yield MJPEG-encoded frames asynchronously and update camera parameters."""
+    try:
+        next_tick = time.monotonic()
+        while getattr(app.state, "q_frame", None):
+            frame_data = await run.io_bound(get_frame, app.state.q_frame)
 
-    # Create 1x1 black pixel PNG as placeholder image that will be shown when no frame is available
-    placeholder_bytes = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-    )
+            if frame_data:
+                frame_bytes, frame_bytes_length, lens_pos, iso_sens, exp_time = frame_data
 
-    @app.get("/video/frame")
-    async def serve_frame():
-        """Serve MJPEG-encoded frame from OAK camera over HTTP and update camera parameters."""
-        if AUTO_RUN_MARKER.exists():
-            # Create marker file to indicate user interaction (active streaming) if in auto-run mode
-            STREAMING_MARKER.touch()
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + frame_bytes_length + b"\r\n\r\n"
+                       + frame_bytes + b"\r\n")
 
-        if hasattr(app.state, "q_frame") and app.state.q_frame and app.state.q_frame.has():
-            # Get MJPEG-encoded HQ frame and associated data (synced with tracker output)
-            frame_dai = app.state.q_frame.get()          # depthai.ImgFrame (type: BITSTREAM)
-            frame_bytes = frame_dai.getData().tobytes()  # convert bitstream (numpy array) to bytes
+                # Update camera parameters twice per second
+                app.state.frame_count += 1
+                current_time = time.monotonic()
+                elapsed_time = current_time - app.state.prev_time
+                if elapsed_time > 0.5:
+                    app.state.fps = round(app.state.frame_count / elapsed_time, 2)
+                    app.state.lens_pos = lens_pos if lens_pos is not None else 0
+                    app.state.iso_sens = iso_sens if iso_sens is not None else 0
+                    app.state.exp_time = exp_time if exp_time is not None else 0
+                    app.state.frame_count = 0
+                    app.state.prev_time = current_time
+            else:
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/png\r\n"
+                       b"Content-Length: " + PLACEHOLDER_PNG_BYTES_LENGTH + b"\r\n\r\n"
+                       + PLACEHOLDER_PNG_BYTES + b"\r\n")
 
-            # Update camera parameters twice per second
-            app.state.frame_count += 1
-            current_time = time.monotonic()
-            elapsed_time = current_time - app.state.prev_time
-            if elapsed_time > 0.5:
-                app.state.fps = round(app.state.frame_count / elapsed_time, 2)
-                app.state.lens_pos = frame_dai.getLensPosition()
-                app.state.iso_sens = frame_dai.getSensitivity()
-                app.state.exp_time = frame_dai.getExposureTime().total_seconds() * 1000  # milliseconds
-                app.state.frame_count = 0
-                app.state.prev_time = current_time
-
-            return Response(content=frame_bytes, media_type="image/jpeg")
-        else:
-            return Response(content=placeholder_bytes, media_type="image/png")
-
-
-async def update_frame():
-    """Update frame source with a timestamp to prevent caching."""
-    app.state.frame_ii.set_source(f"/video/frame?{time.monotonic()}")
+            next_tick += app.state.refresh_interval
+            delay = next_tick - time.monotonic()
+            # Reset next_tick if more than one interval late to avoid drift or frame bursts
+            if delay < -app.state.refresh_interval:
+                next_tick = time.monotonic()
+            await asyncio.sleep(max(delay, 0))
+    except asyncio.CancelledError:
+        return
 
 
-async def update_tracker_data():
-    """Update data from object tracker and detection model, set exposure region if enabled."""
-    tracklets_data = []
+async def get_tracker_data():
+    """Get model/tracker data from the OAK camera output queue, set exposure region if enabled."""
+    tracker_data = []
     track_id_max = -1
     track_id_max_bbox = None
 
-    if hasattr(app.state, "q_track") and app.state.q_track and app.state.q_track.has():
-        # Get tracker output (including passthrough model output)
-        tracklets = app.state.q_track.get().tracklets
+    if getattr(app.state, "q_track", None):
+        tracklets_msg = app.state.q_track.tryGet()  # depthai.Tracklets
+        if tracklets_msg is None:
+            return None
+        tracklets = tracklets_msg.tracklets
         for tracklet in tracklets:
             # Check if tracklet is active (not "LOST" or "REMOVED")
             tracklet_status = tracklet.status.name
@@ -279,7 +399,7 @@ async def update_tracker_data():
                     "x_max": round(bbox[2], 4),
                     "y_max": round(bbox[3], 4)
                 }
-                tracklets_data.append(tracklet_data)
+                tracker_data.append(tracklet_data)
 
         if app.state.config_updates["detection"]["exposure_region"]["enabled"]:
             if track_id_max_bbox:
@@ -295,21 +415,21 @@ async def update_tracker_data():
                 app.state.q_ctrl.send(exp_ctrl)
                 app.state.exposure_region_active = False
 
-    app.state.tracker_data = tracklets_data
+    return tracker_data
 
 
-async def update_overlay():
-    """Update SVG overlay to show latest tracker/model data."""
-    svg_overlay = [
+async def build_overlay(tracker_data):
+    """Build SVG overlay with latest model/tracker data."""
+    svg_parts = [
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1" width="100%" height="100%" '
         'style="position:absolute; top:0; left:0; pointer-events:none;">'
     ]
 
-    for data in app.state.tracker_data:
+    for data in tracker_data:
         label = data["label"]
         confidence = data["confidence"]
         track_id = data["track_ID"]
-        x_min = (data["x_min"] - 0.5) * app.state.aspect_ratio + 0.5  # transform based on aspect ratio
+        x_min = (data["x_min"] - 0.5) * app.state.aspect_ratio + 0.5
         y_min = data["y_min"]
         x_max = (data["x_max"] - 0.5) * app.state.aspect_ratio + 0.5
         y_max = data["y_max"]
@@ -317,14 +437,14 @@ async def update_overlay():
         height = y_max - y_min
 
         # Add rectangle for bounding box
-        svg_overlay.append(
+        svg_parts.append(
             f'<rect x="{x_min}" y="{y_min}" width="{width}" height="{height}" '
             'fill="none" stroke="red" stroke-width="0.006" stroke-opacity="0.5" />'
         )
 
-        # Add text for tracker/model data
+        # Add text for model/tracker data
         text_y = y_min + height + 0.04 if y_min + height < 0.95 else y_min - 0.05
-        svg_overlay.append(
+        svg_parts.append(
             f'<text x="{x_min}" y="{text_y}" '
             'font-size="0.04" fill="white" stroke="black" stroke-width="0.005" '
             'paint-order="stroke" text-anchor="start" font-weight="bold">'
@@ -332,42 +452,27 @@ async def update_overlay():
             f'<tspan x="{x_min}" dy="0.04">ID: {track_id}</tspan></text>'
         )
 
-    svg_overlay.append("</svg>")
-    app.state.frame_ii.set_content("".join(svg_overlay))
+    svg_parts.append("</svg>")
+    return "".join(svg_parts)
 
 
-async def update_frame_and_overlay():
-    """Update frame and tracker/model data + overlay if enabled."""
-    await update_frame()
+async def update_overlay():
+    """Get latest model/tracker data and update overlay."""
     if app.state.show_overlay or app.state.config_updates["detection"]["exposure_region"]["enabled"]:
-        await update_tracker_data()
-        if app.state.show_overlay and app.state.tracker_data:
-            await update_overlay()
-        else:
-            app.state.frame_ii.set_content("")
+        tracker_data = await get_tracker_data()
+        if not tracker_data:
+            if not getattr(app.state, "last_overlay_empty", False):
+                app.state.frame_ii.set_content("")
+                app.state.last_overlay_empty = True
+            return
+        if app.state.show_overlay:
+            svg_overlay = await build_overlay(tracker_data)
+            app.state.frame_ii.set_content(svg_overlay)
+            app.state.last_overlay_empty = False
     else:
-        app.state.frame_ii.set_content("")
-
-
-def create_video_stream_container():
-    """Create video stream container with responsive aspect ratio and row with camera parameters."""
-    with ui.element("div").classes("w-full p-0 overflow-hidden bg-black border border-gray-700"):
-        with ui.element("div").classes(f"relative w-full pb-[{100/app.state.aspect_ratio}%]"):
-            with ui.element("div").classes("absolute inset-0 flex items-center justify-center"):
-                app.state.frame_ii = ui.interactive_image(content="").classes("max-w-full max-h-full object-contain")
-
-    with ui.row(align_items="center").classes("w-full gap-2 -mt-3"):
-        (ui.label().classes("font-bold text-xs")
-         .bind_text_from(app.state, "fps", lambda fps: f"FPS: {fps}"))
-        ui.separator().props("vertical")
-        (ui.label().classes("font-bold text-xs")
-         .bind_text_from(app.state, "lens_pos", lambda pos: f"Lens Position: {pos}"))
-        ui.separator().props("vertical")
-        (ui.label().classes("font-bold text-xs")
-         .bind_text_from(app.state, "iso_sens", lambda iso: f"ISO: {iso}"))
-        ui.separator().props("vertical")
-        (ui.label().classes("font-bold text-xs")
-         .bind_text_from(app.state, "exp_time", lambda exp: f"Exposure: {exp:.1f} ms"))
+        if not getattr(app.state, "last_overlay_empty", False):
+            app.state.frame_ii.set_content("")
+            app.state.last_overlay_empty = True
 
 
 async def set_manual_focus(e):
@@ -514,28 +619,34 @@ async def get_location():
 def create_deployment_section():
     """Create UI elements and config binding for deployment metadata."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         (ui.label("Start Time").classes("font-bold")
          .tooltip("Start date + time of the camera deployment (ISO 8601 format)"))
         with ui.row(align_items="center").classes("w-full gap-2"):
             time_label = (ui.label().classes("flex-1 min-h-8 py-2 px-3 rounded border border-gray-700")
                           .bind_text(app.state.config_updates["deployment"], "start"))
-            ui.button("Get Time", icon="event",
+            ui.button("Get RPi Time", icon="event",
                       on_click=lambda: time_label.set_text(str(datetime.now().isoformat())))
 
         grid_separator()
         (ui.label("Location").classes("font-bold")
-         .tooltip("Location of the camera deployment (latitude + longitude)"))
+         .tooltip("Location of the camera deployment"))
         with ui.column().classes("w-full gap-2"):
             with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
                 ui.label("Latitude:").classes("font-bold")
-                (ui.label().classes("flex-1 min-h-8 py-2 px-3 rounded border border-gray-700")
-                 .bind_text(app.state.config_updates["deployment"]["location"], "latitude"))
+                (ui.number(label="Latitude (decimal degrees)",
+                           min=-90, max=90, precision=6, step=0.000001)
+                 .bind_value(app.state.config_updates["deployment"]["location"], "latitude",
+                             forward=lambda v: float(v) if v not in (None, "") else None))
                 ui.label("Longitude:").classes("font-bold")
-                (ui.label().classes("flex-1 min-h-8 py-2 px-3 rounded border border-gray-700")
-                 .bind_text(app.state.config_updates["deployment"]["location"], "longitude"))
-                ui.label("Accuracy (m):").classes("font-bold")
-                (ui.label().classes("flex-1 min-h-8 py-2 px-3 rounded border border-gray-700")
-                 .bind_text(app.state.config_updates["deployment"]["location"], "accuracy"))
+                (ui.number(label="Longitude (decimal degrees)",
+                           min=-180, max=180, precision=6, step=0.000001)
+                 .bind_value(app.state.config_updates["deployment"]["location"], "longitude",
+                             forward=lambda v: float(v) if v not in (None, "") else None))
+                ui.label("Accuracy:").classes("font-bold")
+                (ui.number(label="Accuracy", min=0, max=1000, precision=1, step=1, suffix="m")
+                 .bind_value(app.state.config_updates["deployment"]["location"], "accuracy",
+                             forward=lambda v: int(v) if v not in (None, "") else None))
             loc_button = ui.button("Get Location", icon="my_location", on_click=get_location)
             if not app.state.config.webapp.https.enabled:
                 loc_button.disable()
@@ -547,6 +658,15 @@ def create_deployment_section():
         (ui.input(placeholder="Enter background setting").props("clearable")
          .bind_value(app.state.config_updates["deployment"], "setting",
                      forward=lambda v: str(v) if v is not None else None))
+
+        grid_separator()
+        (ui.label("Distance").classes("font-bold")
+         .tooltip("Distance from camera to background (e.g. platform/flower)"))
+        (ui.number(label="Distance", min=8, max=100, precision=0, step=1, suffix="cm",
+                   validation={"Optional value between 8-100":
+                               lambda v: v in (None, "") or validate_number(v, 8, 100)})
+         .bind_value(app.state.config_updates["deployment"], "distance",
+                     forward=lambda v: int(v) if v not in (None, "") else None))
 
         grid_separator()
         (ui.label("Notes").classes("font-bold")
@@ -580,6 +700,7 @@ async def on_focus_type_change(e):
 def create_camera_settings():
     """Create UI elements and config binding for camera settings."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         ui.label("Focus Mode").classes("font-bold")
         (ui.select(["continuous", "manual", "range"], label="Mode", on_change=on_focus_mode_change)
          .bind_value(app.state.config_updates["camera"]["focus"], "mode"))
@@ -594,20 +715,20 @@ def create_camera_settings():
             with (ui.column().classes("w-full gap-1")
                   .bind_visibility_from(app.state, "focus_distance_enabled")):
                 with ui.row(align_items="center").classes("w-full gap-2"):
-                    (ui.number(label="Manual (cm)",
+                    (ui.number(label="Manual Focus",
                                placeholder=app.state.config.camera.focus.distance.manual,
-                               min=8, max=80, precision=0, step=1).classes("flex-1")
+                               min=8, max=80, precision=0, step=1, suffix="cm").classes("flex-1")
                      .bind_value(app.state.config_updates["camera"]["focus"]["distance"], "manual",
                                  forward=lambda v: int(v) if v is not None else None))
                 with ui.row(align_items="center").classes("w-full gap-2"):
-                    (ui.number(label="Range Min (cm)",
+                    (ui.number(label="Range Min",
                                placeholder=app.state.config.camera.focus.distance.range.min,
-                               min=8, max=75, precision=0, step=1).classes("flex-1")
+                               min=8, max=75, precision=0, step=1, suffix="cm").classes("flex-1")
                      .bind_value(app.state.config_updates["camera"]["focus"]["distance"]["range"], "min",
                                  forward=lambda v: int(v) if v is not None else None))
-                    (ui.number(label="Range Max (cm)",
+                    (ui.number(label="Range Max",
                                placeholder=app.state.config.camera.focus.distance.range.max,
-                               min=9, max=80, precision=0, step=1).classes("flex-1")
+                               min=9, max=80, precision=0, step=1, suffix="cm").classes("flex-1")
                      .bind_value(app.state.config_updates["camera"]["focus"]["distance"]["range"], "max",
                                  forward=lambda v: int(v) if v is not None else None))
                 (ui.label("Focus control slider will still use lens position for finer adjustment!")
@@ -681,6 +802,7 @@ async def on_exposure_region_change(e):
 def create_detection_settings():
     """Create UI elements and config binding for detection settings."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         (ui.label("Detection-based Exposure").classes("font-bold")
          .tooltip("Use bounding box from most recent tracking ID to set auto exposure region"))
         (ui.switch("Enable", on_change=on_exposure_region_change).props("color=green").classes("font-bold")
@@ -728,6 +850,7 @@ def create_detection_settings():
 def create_recording_settings():
     """Create UI elements and config binding for recording settings."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         ui.label("Duration").classes("font-bold").tooltip("Duration per recording session")
         with ui.column().classes("w-full"):
             with ui.tabs().classes("w-full") as tabs:
@@ -753,17 +876,17 @@ def create_recording_settings():
             with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
                 (ui.label("Detection").classes("font-bold")
                  .tooltip("Interval for saving HQ frame + metadata while object is detected"))
-                (ui.number(label="Seconds",
+                (ui.number(label="Capture Interval",
                            placeholder=app.state.config.recording.capture_interval.detection,
-                           min=0, max=3600, precision=1, step=0.1,
+                           min=0, max=3600, precision=1, step=0.1, suffix="seconds",
                            validation={"Required value between 0-3600":
                                        lambda v: validate_number(v, 0, 3600)})
                  .bind_value(app.state.config_updates["recording"]["capture_interval"], "detection"))
                 (ui.label("Timelapse").classes("font-bold")
                  .tooltip("Interval for saving HQ frame (independent of detected objects)"))
-                (ui.number(label="Seconds",
+                (ui.number(label="Capture Interval",
                            placeholder=app.state.config.recording.capture_interval.timelapse,
-                           min=0, max=3600, precision=1, step=0.1,
+                           min=0, max=3600, precision=1, step=0.1, suffix="seconds",
                            validation={"Required value between 0-3600":
                                        lambda v: validate_number(v, 0, 3600)})
                  .bind_value(app.state.config_updates["recording"]["capture_interval"], "timelapse"))
@@ -778,6 +901,7 @@ def create_recording_settings():
 def create_processing_settings():
     """Create UI elements and config binding for post-processing settings."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         (ui.label("Crop Detections").classes("font-bold")
          .tooltip("Crop detections from HQ frames and save as individual .jpg images"))
         with ui.column().classes("w-full gap-1"):
@@ -829,6 +953,7 @@ def create_processing_settings():
 def create_startup_settings():
     """Create UI elements and config binding for startup settings."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         (ui.label("Hotspot Setup").classes("font-bold")
          .tooltip("Create RPi Wi-Fi hotspot if it doesn't exist (uses hostname for SSID and password)"))
         (ui.switch("Enable").props("color=green").classes("font-bold")
@@ -869,6 +994,7 @@ def create_startup_settings():
 def create_webapp_settings():
     """Create UI elements and config binding for web app settings."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         (ui.label("Frame Rate").classes("font-bold")
          .tooltip("Max. possible streamed FPS depends on resolution"))
         (ui.number(label="FPS", placeholder=app.state.config.webapp.fps,
@@ -915,6 +1041,7 @@ def create_webapp_settings():
 def create_system_settings():
     """Create UI elements and config binding for system settings."""
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         (ui.label("Power Management").classes("font-bold")
          .tooltip("Disable if no power management board is connected"))
         with ui.column().classes("w-full gap-1"):
@@ -975,6 +1102,17 @@ def create_system_settings():
                          forward=lambda v: int(v) if v is not None else None))
 
         grid_separator()
+        (ui.label("Status LED").classes("font-bold")
+         .tooltip("Use LED (e.g. in button) to indicate system status"))
+        with ui.column().classes("w-full gap-1"):
+            (ui.switch("Enable").props("color=green").classes("font-bold")
+             .bind_value(app.state.config_updates["led"], "enabled"))
+            (ui.select(LED_GPIO_PINS, label="GPIO Pin (BCM)").classes("w-full")
+             .bind_visibility_from(app.state.config_updates["led"], "enabled")
+             .bind_value(app.state.config_updates["led"], "gpio_pin",
+                         forward=lambda v: int(v) if v is not None else None))
+
+        grid_separator()
         (ui.label("System Logging").classes("font-bold")
          .tooltip("Log system information (temperature, memory, CPU utilization, battery info)"))
         with ui.column().classes("w-full gap-1"):
@@ -989,46 +1127,48 @@ def create_system_settings():
                          forward=lambda v: int(v) if v is not None else None))
 
 
+def remove_wifi_network(network_row):
+    """Remove a specific network row from UI and config"""
+    if network_row in app.state.wifi_networks_ui:
+        if len(app.state.wifi_networks_ui) > 1:
+            idx = app.state.wifi_networks_ui.index(network_row)
+
+            if idx < len(app.state.config_updates["network"]["wifi"]):
+                app.state.config_updates["network"]["wifi"].pop(idx)
+
+            network_row.delete()
+            app.state.wifi_networks_ui.pop(idx)
+        else:
+            ui.notification("At least one Wi-Fi network must be configured!", type="warning", timeout=2)
+
+
+def add_wifi_network(networks_column, ssid="", password=""):
+    """Add a new Wi-Fi network input field."""
+    with networks_column:
+        new_network = {"ssid": ssid, "password": password}
+        app.state.config_updates["network"]["wifi"].append(new_network)
+        idx = len(app.state.config_updates["network"]["wifi"]) - 1
+
+        with ui.row(align_items="baseline").classes("w-full gap-2") as network_row:
+            (ui.input(label="SSID").props("clearable").classes("flex-1")
+             .bind_value(app.state.config_updates["network"]["wifi"][idx], "ssid",
+                         forward=lambda v: str(v) if v is not None else None))
+            (ui.input(label="Password", validation={
+                "Minimum 8 characters": lambda v: v is None or v == "" or len(str(v)) >= 8})
+             .props("clearable").classes("flex-1")
+             .bind_value(app.state.config_updates["network"]["wifi"][idx], "password",
+                         forward=lambda v: str(v) if v is not None else None))
+            ui.button(color="red", icon="delete",
+                      on_click=lambda: remove_wifi_network(network_row)).props("round")
+
+    app.state.wifi_networks_ui.append(network_row)
+
+
 def create_network_settings():
     """Create UI elements and config binding for network settings."""
     app.state.wifi_networks_ui = []
-
-    def remove_wifi_network(network_row):
-        """Remove a specific network row from UI and config"""
-        if network_row in app.state.wifi_networks_ui:
-            if len(app.state.wifi_networks_ui) > 1:
-                idx = app.state.wifi_networks_ui.index(network_row)
-
-                if idx < len(app.state.config_updates["network"]["wifi"]):
-                    app.state.config_updates["network"]["wifi"].pop(idx)
-
-                network_row.delete()
-                app.state.wifi_networks_ui.pop(idx)
-            else:
-                ui.notification("At least one Wi-Fi network must be configured!", type="warning", timeout=2)
-
-    def add_wifi_network(networks_column, ssid="", password=""):
-        """Add a new Wi-Fi network input field."""
-        with networks_column:
-            new_network = {"ssid": ssid, "password": password}
-            app.state.config_updates["network"]["wifi"].append(new_network)
-            idx = len(app.state.config_updates["network"]["wifi"]) - 1
-
-            with ui.row(align_items="baseline").classes("w-full gap-2") as network_row:
-                (ui.input(label="SSID").props("clearable").classes("flex-1")
-                 .bind_value(app.state.config_updates["network"]["wifi"][idx], "ssid",
-                             forward=lambda v: str(v) if v is not None else None))
-                (ui.input(label="Password", validation={
-                    "Minimum 8 characters": lambda v: v is None or v == "" or len(str(v)) >= 8})
-                 .props("clearable").classes("flex-1")
-                 .bind_value(app.state.config_updates["network"]["wifi"][idx], "password",
-                             forward=lambda v: str(v) if v is not None else None))
-                ui.button(color="red", icon="delete",
-                          on_click=lambda: remove_wifi_network(network_row)).props("round")
-
-        app.state.wifi_networks_ui.append(network_row)
-
     with ui.grid(columns="auto 1fr").classes("w-full gap-x-5 items-center"):
+
         ui.label("Mode").classes("font-bold").tooltip("Network mode of the Raspberry Pi")
         (ui.select(["hotspot", "wifi"], label="Network Mode").classes("w-full")
          .bind_value(app.state.config_updates["network"], "mode"))
@@ -1060,6 +1200,82 @@ def create_network_settings():
                       on_click=lambda: add_wifi_network(networks_column))
 
 
+async def update_sys_info():
+    """Update system information from RPi and OAK camera."""
+    rpi_info = get_rpi_info()
+    oak_info = get_oak_info(app.state.q_syslog)
+    if rpi_info:
+        app.state.sys_info.update(rpi_info)
+    if oak_info:
+        app.state.sys_info.update(oak_info)
+
+
+def create_sys_info_section():
+    """Create UI elements for displaying RPi and OAK system information."""
+    with ui.grid(columns="auto 1fr 1fr").classes("w-full gap-x-1 items-center"):
+        ui.element()
+        ui.label("RPi").classes("text-center text-h6 font-bold")
+        ui.label("OAK").classes("text-center text-h6 font-bold")
+
+        with ui.row(align_items="center").classes("gap-1"):
+            ui.icon("thermostat", size="sm", color="orange")
+            ui.label("TEMP")
+        (ui.label().classes("text-center")
+         .bind_text_from(app.state.sys_info, "rpi_cpu_temp", lambda t: f"CPU: {t} °C"))
+        (ui.label().classes("text-center")
+         .bind_text_from(app.state.sys_info, "oak_chip_temp", lambda t: f"Chip: {t} °C"))
+
+        with ui.row(align_items="center").classes("gap-1"):
+            ui.icon("speed", size="sm", color="blue")
+            ui.label("CPU")
+        with ui.column().classes("w-full gap-0"):
+            (ui.label().classes("w-full text-center")
+             .bind_text_from(app.state.sys_info, "rpi_cpu_usage_avg", lambda u: f"Average Usage: {u} %"))
+            (ui.label().classes("w-full text-center")
+             .bind_text_from(app.state.sys_info, "rpi_cpu_usage_sum", lambda u: f"Sum All Cores: {u} %"))
+        with ui.column().classes("w-full gap-0"):
+            (ui.label().classes("w-full text-center")
+             .bind_text_from(app.state.sys_info, "oak_cpu_usage_css", lambda u: f"CSS Core: {u} %"))
+            (ui.label().classes("w-full text-center")
+             .bind_text_from(app.state.sys_info, "oak_cpu_usage_mss", lambda u: f"MSS Core: {u} %"))
+
+        with ui.row(align_items="center").classes("gap-1"):
+            ui.icon("memory", size="sm", color="green")
+            ui.label("RAM")
+        with ui.grid(columns="auto auto").classes("w-full gap-0 items-center"):
+            ui.label("Usage").classes("text-center mb-1")
+            ui.label("Free").classes("text-center mb-1")
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "rpi_ram_usage", lambda u: f"{u} %"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "rpi_ram_available", lambda a: f"{a} MB"))
+        with ui.grid(columns="auto auto").classes("w-full gap-0 items-center"):
+            ui.label("Usage").classes("text-center mb-1")
+            ui.label("Free").classes("text-center mb-1")
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_usage_ddr", lambda u: f"DDR: {u} %"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_available_ddr", lambda a: f"{a} MB"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_usage_css", lambda u: f"CSS: {u} %"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_available_css", lambda a: f"{a} MB"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_usage_mss", lambda u: f"MSS: {u} %"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_available_mss", lambda a: f"{a} MB"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_usage_cmx", lambda u: f"CMX: {u} %"))
+            (ui.label().classes("text-center text-xs")
+             .bind_text_from(app.state.sys_info, "oak_ram_available_cmx", lambda a: f"{a} MB"))
+
+
+def read_split_log(log_path, max_lines=1000):
+    """Read log file and return the last requested lines."""
+    with open(log_path, "r", encoding="utf-8") as log_file:
+        return list(deque(log_file, maxlen=max_lines))
+
+
 async def update_log_content(selected_log, log_display):
     """Update content of log element based on selected log file."""
     log_display.clear()
@@ -1068,24 +1284,25 @@ async def update_log_content(selected_log, log_display):
         return
 
     try:
-        with open(LOGS_PATH / selected_log, "r", encoding="utf-8") as log_file:
-            content = log_file.read()
+        log_lines = await run.io_bound(read_split_log, LOGS_PATH / selected_log, max_lines=1000)
     except Exception as e:
         log_display.push(f"Error reading log file: {str(e)}", classes="text-red")
         return
 
-    if content.strip():
-        for line in content.strip().split("\n"):
-            if "INFO" in line:
-                log_display.push(line, classes="text-green")
-            elif "WARNING" in line:
-                log_display.push(line, classes="text-orange")
-            elif "ERROR" in line:
-                log_display.push(line, classes="text-red")
-            else:
-                log_display.push(line)
-    else:
+    if not log_lines:
         log_display.push("Log file is empty", classes="text-gray")
+        return
+
+    for idx, line in enumerate(log_lines):
+        lower = line.lower()
+        if "error" in lower or "exception" in lower:
+            log_display.push(line, classes="text-red")
+        elif "warning" in lower:
+            log_display.push(line, classes="text-orange")
+        else:
+            log_display.push(line)
+        if (idx + 1) % 50 == 0:
+            await asyncio.sleep(0)  # yield control back to the event loop to avoid blocking of UI
 
 
 def create_logs_section():
@@ -1099,7 +1316,7 @@ def create_logs_section():
                                    on_change=lambda e: update_log_content(e.value, log_display))
                          .classes("w-full truncate"))
 
-        log_display = (ui.log(max_lines=500).classes("w-full h-96 font-mono text-xs")
+        log_display = (ui.log(max_lines=1000).classes("w-full h-96 font-mono text-xs")
                        .bind_visibility_from(log_select_ui, "value",
                                              backward=lambda v: v is not None and v != ""))
 
@@ -1145,7 +1362,9 @@ async def apply_config_changes(config_name, has_network_changes, config_selected
     await asyncio.sleep(0.5)
     update_config_selector(BASE_PATH, config_name)
     app.state.config_active = config_name
-    await restart_camera()
+    await close_camera()
+    await asyncio.sleep(0.5)
+    ui.navigate.reload()
 
 
 async def show_apply_dialog(config_name, has_network_changes):
@@ -1187,8 +1406,9 @@ async def show_activate_dialog(config_name, has_network_changes):
         await apply_config_changes(config_name, has_network_changes)
     else:
         # Refresh all UI elements to reflect the still active config (reset config_updates)
-        create_ui_layout.refresh()
         ui.notification("Configuration not activated!", type="warning", timeout=2)
+        await asyncio.sleep(0.5)
+        create_ui_layout.refresh()
 
 
 async def save_to_file(config_path):
@@ -1215,24 +1435,24 @@ async def save_to_file(config_path):
         await show_activate_dialog(config_path.name, has_network_changes)
 
 
+async def config_name_input():
+    """Show dialog to enter a name for the new configuration file."""
+    with ui.dialog() as dialog, ui.card():
+        ui.label("Name for new config file:")
+        i = (ui.input(placeholder="config_custom",
+                      validation={"Please enter a valid filename":
+                                  lambda v: v is not None and all(c.isalnum() or c in "_-" for c in v)})
+             .props("clearable autofocus suffix='.yaml'"))
+
+        with ui.row().classes("w-full justify-center gap-4 mt-4"):
+            ui.button("Cancel", on_click=lambda: dialog.submit("cancel"))
+            ui.button("Save", on_click=lambda: dialog.submit(i.value), color="green")
+
+    return await dialog
+
+
 async def create_new_config():
     """Create a new configuration file."""
-
-    async def config_name_input():
-        """Show dialog to enter a name for the new configuration file."""
-        with ui.dialog() as dialog, ui.card():
-            ui.label("Name for new config file:")
-            i = (ui.input(placeholder="config_custom",
-                          validation={"Please enter a valid filename":
-                                      lambda v: v is not None and all(c.isalnum() or c in "_-" for c in v)})
-                 .props("clearable autofocus suffix='.yaml'"))
-
-            with ui.row().classes("w-full justify-center gap-4 mt-4"):
-                ui.button("Cancel", on_click=lambda: dialog.submit("cancel"))
-                ui.button("Save", on_click=lambda: dialog.submit(i.value), color="green")
-
-        return await dialog
-
     filename = await config_name_input()
     if not filename:
         ui.notification("Please enter a valid filename!", type="warning", timeout=2)
@@ -1326,6 +1546,7 @@ async def start_recording():
         ui.notification("Stopping web app and start recording...",
                         position="top", type="ongoing", spinner=True, timeout=3)
         await asyncio.sleep(0.5)
+        await close_camera()
         app.shutdown()
 
 
@@ -1359,6 +1580,7 @@ async def confirm_shutdown():
     if shutdown:
         ui.notification("Stopping web app...", position="top", type="ongoing", spinner=True, timeout=3)
         await asyncio.sleep(0.5)
+        await close_camera()
         app.shutdown()
 
 
@@ -1368,72 +1590,69 @@ async def disconnect():
         await core.sio.disconnect(client_id)
 
 
-async def cleanup():
-    """Disconnect clients and close running OAK device, start recording if requested."""
+async def on_app_shutdown():
+    """Disconnect clients, close running OAK device, and optionally start recording."""
     await disconnect()
+    await close_camera()
 
-    if hasattr(app.state, "device") and app.state.device is not None:
-        app.state.device.close()
-
-    if hasattr(app.state, "start_recording") and app.state.start_recording:
-        subprocess_log(LOGS_PATH, "yolo_tracker_save_hqsync.py")
+    if getattr(app.state, "start_recording", False):
+        subprocess_log(LOGS_PATH, "trigger_capture.py")
 
         with open(LOGS_PATH / "subprocess.log", "a", encoding="utf-8") as log_file_handle:
             subprocess.Popen(
-                [sys.executable, str(BASE_PATH / "yolo_tracker_save_hqsync.py")],
+                [sys.executable, str(BASE_PATH / "trigger_capture.py")],
                 stdout=log_file_handle,
                 stderr=log_file_handle,
                 start_new_session=True
             )
 
-    # Force exit web app after timeout
-    loop = asyncio.get_event_loop()
-    loop.call_later(10, lambda: print("Web app forced to exit after timeout.") or sys.exit(0))
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_later(10, lambda: logger.warning("Web app forced to exit after timeout.") or sys.exit(0))
+    except RuntimeError:
+        logger.warning("No running event loop found, exiting immediately.")
+        sys.exit(0)
 
 
-def signal_handler(signum, frame):
-    """Handle a received signal (e.g. keyboard interrupt) to gracefully shut down the app."""
-    print("Signal received, initiating graceful app shutdown...")
+def signal_handler(loop, signum, frame):
+    """Handle a received signal to gracefully shut down the app."""
+    logger.info("Signal received, initiating graceful app shutdown...")
+    loop.create_task(close_camera())
     app.shutdown()
 
 
-# Register cleanup function to be called on app shutdown
-app.on_shutdown(cleanup)
+def on_app_startup(protocol, port, use_https):
+    """Register signal handler and show startup message."""
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT, lambda: signal_handler(loop, signal.SIGINT, None))
+    loop.add_signal_handler(signal.SIGTERM, lambda: signal_handler(loop, signal.SIGTERM, None))
 
-# Register signal handler for graceful shutdown if SIGINT or SIGTERM is received
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+    logger.info("Insect Detect web app ready to go!")
+    logger.info("Access via hostname:   %s://%s:%s", protocol, HOSTNAME, port)
+    logger.info("Access via IP address: %s://%s:%s", protocol, IP_ADDRESS, port)
+    if use_https:
+        logger.info("Accept the self-signed SSL certificate in your browser when first connecting.")
+
 
 if __name__ == "__main__":
-    # Parse config to get web app settings
+    # Parse config and set parameters based on HTTPS setting
     config_selector = parse_yaml(BASE_PATH / "configs" / "config_selector.yaml")
     config_active = config_selector.config_active
     config = parse_yaml(BASE_PATH / "configs" / config_active)
-
-    # Check for HTTPS configuration and certificate existence
     https_enabled = config.webapp.https.enabled
     ssl_cert_path = Path.home() / "ssl_certificates" / "cert.pem"
     ssl_key_path = Path.home() / "ssl_certificates" / "key.pem"
     use_https = https_enabled and ssl_cert_path.exists() and ssl_key_path.exists()
     if https_enabled and not use_https:
-        print("HTTPS is enabled but no SSL certificates were found. Using HTTP instead.")
-
-    # Set parameters based on HTTPS setting
+        logger.warning("HTTPS is enabled but no SSL certificates were found. Using HTTP instead.")
     protocol = "https" if use_https else "http"
     port = 8443 if use_https else 5000
     ssl_cert = str(ssl_cert_path) if use_https else None
     ssl_key = str(ssl_key_path) if use_https else None
 
     # Start the web app with specified parameters
-    def startup_message():
-        """Print startup message with information about web app access."""
-        print("Insect Detect web app ready to go!")
-        print(f"Access via hostname:   {protocol}://{HOSTNAME}:{port}")
-        print(f"Access via IP address: {protocol}://{IP_ADDRESS}:{port}")
-        if use_https:
-            print("Accept the self-signed SSL certificate in your browser when first connecting.")
-
-    app.on_startup(startup_message)
+    app.on_startup(lambda: on_app_startup(protocol, port, use_https))
+    app.on_shutdown(on_app_shutdown)
 
     ui.run(
         host="0.0.0.0",
