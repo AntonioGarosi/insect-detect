@@ -1,0 +1,7 @@
+last_rec_id.txt
+record_log.csv
+configs_backup/
+data/
+logs/
+env_insect_detect/
+.DS_Store
