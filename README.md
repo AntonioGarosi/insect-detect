@@ -1,4 +1,4 @@
-# Insect Detect - DIY camera trap for automated insect monitoring
+# _Fork_ of Insect Detect - DIY camera trap for automated insect monitoring
 
 <img src="https://raw.githubusercontent.com/maxsitt/insect-detect-docs/main/docs/assets/logo.png" width="540">
 
@@ -30,7 +30,7 @@ open source software and can be easily assembled and set up with the
 Install all dependencies/packages and automatically run the required setup steps:
 
 ``` bash
-wget -qO- https://raw.githubusercontent.com/maxsitt/insect-detect/main/insect_detect_install.sh | bash
+wget -qO- https://raw.githubusercontent.com/AntonioGarosi/insect-detect/refs/heads/main/insect_detect_install.sh | bash
 ```
 
 **Optional:** Install and configure [Rclone](https://rclone.org/docs/) if you want to use the upload feature:
@@ -114,6 +114,10 @@ information on how to classify the cropped detections with the provided classifi
 
 Take a look at the [post-processing](https://maxsitt.github.io/insect-detect-docs/deployment/post-processing/)
 instructions for information on how to post-process the metadata with classification results.
+
+## Fork information
+
+This is a fork the [PollinActon](https://www.pollinaction.com) project.
 
 ---
 
