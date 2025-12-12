@@ -27,7 +27,7 @@ cd "$HOME"
 if [[ ! -d "insect-detect" ]]; then
     echo
     echo "[2/8] Cloning 'insect-detect' repository..."
-    if ! git clone https://github.com/maxsitt/insect-detect; then
+    if ! git clone https://github.com/AntonioGarosi/insect-detect.git; then # Cloning fork instead of original repository
         echo "ERROR: Failed to clone repository. Please retry or check your internet connection."
         exit 1
     fi
