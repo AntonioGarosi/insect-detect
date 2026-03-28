@@ -114,6 +114,7 @@ if config.startup.auto_run.enabled:
                 stderr=log_file_handle,
                 start_new_session=True
             )
+            primary_process.wait()
 
         if config.startup.auto_run.fallback and Path(BASE_PATH / config.startup.auto_run.fallback).exists():
             delay = config.startup.auto_run.delay
@@ -147,6 +148,7 @@ if config.startup.auto_run.enabled:
                         stderr=log_file_handle,
                         start_new_session=True
                     )
+                    primary_process.wait()
         else:
             logger.info("Fallback script is not specified or does not exist, skipping fallback execution")
     else:
