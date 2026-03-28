@@ -6,15 +6,15 @@ After=network.target NetworkManager.service
 Before=multi-user.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/insect-detect
 ExecStart=/home/pi/env_insdet/bin/python3 /home/pi/insect-detect/startup.py
 Environment=PYTHONPATH=/home/pi/insect-detect
 Environment=HOME=/home/pi
-RemainAfterExit=yes
-Restart=no
+Restart=always
+RestartSec=10
 TimeoutStartSec=3600
 TimeoutStopSec=30
 PrivateTmp=true
